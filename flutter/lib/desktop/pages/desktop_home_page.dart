@@ -50,6 +50,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  String _fixedPassword = '';
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -93,6 +94,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       buildTip(context),
       if (!isOutgoingOnly) buildIDBoard(context),
       if (!isOutgoingOnly) buildPasswordBoard(context),
+      if (!isOutgoingOnly) buildFixedPasswordBoard(context),
       FutureBuilder<Widget>(
         future: Future.value(
             Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
@@ -288,6 +290,55 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             return buildPasswordBoard2(context, model);
           },
         ));
+  }
+
+  Widget buildFixedPasswordBoard(BuildContext context) {
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    return Container(
+      margin: EdgeInsets.only(left: 20.0, right: 16, top: 13, bottom: 13),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.baseline,
+        textBaseline: TextBaseline.alphabetic,
+        children: [
+          Container(width: 2, height: 52, decoration: BoxDecoration(color: MyTheme.accent)),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 7),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  AutoSizeText(
+                    '固定密码',
+                    style: TextStyle(fontSize: 14, color: textColor?.withOpacity(0.5)),
+                    maxLines: 1,
+                  ),
+                  Row(
+                    children: [
+                      Expanded(child: Text(_fixedPassword.isEmpty ? '（未生成）' : _fixedPassword)),
+                      const SizedBox(width: 8),
+                      ElevatedButton(
+                        onPressed: () {
+                          try {
+                            final newPwd = bind.refreshLocalFixedPassword();
+                            setState(() => _fixedPassword = newPwd);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('密码已刷新: $newPwd')),
+                            );
+                          } catch (e) {
+                            // ignore
+                          }
+                        },
+                        child: const Text('刷新密码'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   buildPasswordBoard2(BuildContext context, ServerModel model) {
@@ -697,6 +748,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   void initState() {
     super.initState();
+    try {
+      _fixedPassword = bind.ensureLocalFixedPassword();
+    } catch (e) {
+      _fixedPassword = '';
+    }
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
       final error = await bind.mainGetError();
