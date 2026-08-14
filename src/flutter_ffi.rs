@@ -3168,3 +3168,44 @@ pub mod server_side {
         jboolean::from(crate::server::is_clipboard_service_ok())
     }
 }
+
+use rand::Rng;
+
+/// 生成 12 位随机密码（大小写字母 + 数字）
+fn generate_random_password() -> String {
+    let charset: Vec<char> = ('A'..='Z')
+        .chain('a'..='z')
+        .chain('0'..='9')
+        .collect();
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| charset[rng.gen_range(0..charset.len())])
+        .collect()
+}
+
+/// 首次启动：若本地未设置固定密码则自动生成
+#[flutter_rust_bridge::frb(sync)]
+pub fn ensure_local_fixed_password() -> SyncReturn<String> {
+    let current = crate::ui_interface::get_option("password");
+    if current.is_empty() {
+        let new_pwd = generate_random_password();
+        crate::ui_interface::set_option("password".to_string(), new_pwd.clone());
+        SyncReturn(new_pwd)
+    } else {
+        SyncReturn(current)
+    }
+}
+
+/// 刷新密码：本地生成新密码
+#[flutter_rust_bridge::frb(sync)]
+pub fn refresh_local_fixed_password() -> SyncReturn<String> {
+    let new_pwd = generate_random_password();
+    crate::ui_interface::set_option("password".to_string(), new_pwd.clone());
+    SyncReturn(new_pwd)
+}
+
+/// 获取当前固定密码
+#[flutter_rust_bridge::frb(sync)]
+pub fn get_local_fixed_password() -> SyncReturn<String> {
+    SyncReturn(crate::ui_interface::get_option("password"))
+}
