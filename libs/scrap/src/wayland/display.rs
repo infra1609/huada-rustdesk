@@ -19,6 +19,14 @@ static MISSING_LOGICAL_SIZE_WARNED: std::sync::atomic::AtomicBool =
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(1000);
 
+// A failed lookup forks the probe child, and both callers below poll; back off instead.
+const FAILED_LOOKUP_BACKOFF: Duration = Duration::from_secs(5);
+
+static LAST_FAILED_LOOKUP: Mutex<Option<Instant>> = Mutex::new(None);
+
+// Bumped before the caches are dropped, so a lookup already out can tell its answer is stale.
+static INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Displays {
     pub primary: usize,
     pub displays: Vec<WaylandDisplayInfo>,
@@ -171,12 +179,47 @@ fn get_primary_monitor() -> Option<String> {
         .or_else(try_gdbus_primary)
 }
 
+// Whether a lookup may run, given when the last one failed. Pure, so the policy is testable
+// without a compositor.
+fn lookup_allowed(failed_at: Option<Instant>, now: Instant, backoff: Duration) -> bool {
+    failed_at.map_or(true, |at| now.saturating_duration_since(at) >= backoff)
+}
+
+// Enumerates unless a lookup failed within the backoff. A suppressed lookup reports failure, never
+// an earlier layout, so callers see only a state they already handle.
+fn enumerate_unless_backed_off() -> Option<Vec<WaylandDisplayInfo>> {
+    if !lookup_allowed(
+        *LAST_FAILED_LOOKUP.lock().unwrap(),
+        Instant::now(),
+        FAILED_LOOKUP_BACKOFF,
+    ) {
+        return None;
+    }
+    let invalidations = INVALIDATIONS.load(std::sync::atomic::Ordering::Acquire);
+    let probed = get_wayland_displays();
+    {
+        // Compared under the lock that `clear_wayland_displays_cache` takes after bumping the
+        // counter, so an invalidation landing mid-lookup cannot have its clear undone here.
+        let mut last_failed = LAST_FAILED_LOOKUP.lock().unwrap();
+        if INVALIDATIONS.load(std::sync::atomic::Ordering::Acquire) == invalidations {
+            *last_failed = probed.is_err().then(Instant::now);
+        }
+    }
+    match probed {
+        Ok(displays) => Some(displays),
+        Err(err) => {
+            warn!("Failed to get wayland displays: {}", err);
+            None
+        }
+    }
+}
+
 pub fn get_displays() -> Arc<Displays> {
     let mut lock = DISPLAYS.lock().unwrap();
     match lock.as_ref() {
         Some(displays) => displays.clone(),
-        None => match get_wayland_displays() {
-            Ok(displays) => {
+        None => match enumerate_unless_backed_off() {
+            Some(displays) => {
                 let mut primary_index = None;
                 if let Some(name) = get_primary_monitor() {
                     for (i, display) in displays.iter().enumerate() {
@@ -201,20 +244,20 @@ pub fn get_displays() -> Arc<Displays> {
                 *lock = Some(displays.clone());
                 displays
             }
-            Err(err) => {
-                warn!("Failed to get wayland displays: {}", err);
-                Arc::new(Displays {
-                    primary: 0,
-                    displays: Vec::new(),
-                })
-            }
+            None => Arc::new(Displays {
+                primary: 0,
+                displays: Vec::new(),
+            }),
         },
     }
 }
 
+// Bumps the counter first, so a lookup still out cannot re-stamp a failure past the clear below.
 #[inline]
 pub fn clear_wayland_displays_cache() {
+    INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Release);
     let _ = DISPLAYS.lock().unwrap().take();
+    let _ = LAST_FAILED_LOOKUP.lock().unwrap().take();
 }
 
 // Return (min_x, max_x, min_y, max_y)
@@ -223,20 +266,13 @@ pub fn get_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
     desktop_rect_of(&wayland_displays.displays)
 }
 
-// The desktop rect and per-display logical rects, always read live from the
-// compositor in a single roundtrip. Skips the displays cache and the primary-monitor
-// detection (which may spawn external commands), so it is cheap enough to poll for
-// layout changes. https://github.com/rustdesk/rustdesk/issues/15601
+// The desktop rect and per-display logical rects, read live from the compositor in a single
+// roundtrip. Skips the displays cache and the primary-monitor detection (which may spawn
+// external commands), so it is cheap enough to poll for layout changes.
+// https://github.com/rustdesk/rustdesk/issues/15601
 pub fn get_layout_for_uinput_live() -> Option<((i32, i32, i32, i32), Vec<DisplayRect>)> {
-    match get_wayland_displays() {
-        Ok(displays) => {
-            desktop_rect_of(&displays).map(|rect| (rect, logical_rects_of(&displays)))
-        }
-        Err(err) => {
-            warn!("Failed to get wayland displays: {}", err);
-            None
-        }
-    }
+    let displays = enumerate_unless_backed_off()?;
+    desktop_rect_of(&displays).map(|rect| (rect, logical_rects_of(&displays)))
 }
 
 fn desktop_rect_of(displays: &[WaylandDisplayInfo]) -> Option<(i32, i32, i32, i32)> {
@@ -385,6 +421,41 @@ fn map_axis(v: i32, base_origin: i32, base_extent: i32, live_origin: i32, live_e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lookup_runs_when_none_has_failed() {
+        assert!(lookup_allowed(None, Instant::now(), FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[test]
+    fn a_lookup_waits_out_the_backoff_after_a_failure() {
+        // The future `now` sidesteps Instant subtraction, which panics near boot.
+        let failed_at = Instant::now();
+        let now = failed_at + FAILED_LOOKUP_BACKOFF / 2;
+        assert!(!lookup_allowed(Some(failed_at), now, FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[test]
+    fn a_lookup_runs_again_once_the_backoff_has_passed() {
+        let failed_at = Instant::now();
+        let now = failed_at + FAILED_LOOKUP_BACKOFF;
+        assert!(lookup_allowed(Some(failed_at), now, FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[test]
+    fn a_stamp_from_the_future_only_waits_and_never_panics() {
+        // saturating_duration_since answers zero rather than underflowing.
+        let now = Instant::now();
+        let failed_at = now + FAILED_LOOKUP_BACKOFF;
+        assert!(!lookup_allowed(Some(failed_at), now, FAILED_LOOKUP_BACKOFF));
+    }
+
+    #[test]
+    fn an_invalidation_clears_the_stamp_so_the_next_lookup_runs() {
+        *LAST_FAILED_LOOKUP.lock().unwrap() = Some(Instant::now());
+        clear_wayland_displays_cache();
+        assert!(LAST_FAILED_LOOKUP.lock().unwrap().is_none());
+    }
 
     fn display(
         x: i32,
