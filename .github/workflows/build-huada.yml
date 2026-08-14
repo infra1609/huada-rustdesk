@@ -1,0 +1,423 @@
+name: Build 华达远程
+
+# 华达远程 (RustDesk 1.4.9 品牌化定制) 构建流水线
+#
+# 触发方式:
+#   1. 推送 tag: v*-huada-*   (例如 v1.0-huada-1.4.9)
+#   2. 手动 workflow_dispatch
+#
+# 第一轮策略: 仅 Windows x64, 用于验证烧参 / 品牌化 / 本地随机密码
+# 第二轮: 扩展至 macOS x64+arm64 / Linux x64 / Android arm64
+#
+# 版本号取自官方 .github/workflows/flutter-build.yml (1.4.9 tag), 请勿随意改动:
+#   - flutter_rust_bridge 必须为 1.80.1  (Cargo.toml 锁定 "=1.80")
+#   - bridge 生成必须用 Flutter 3.22.3, 构建用 3.24.5
+
+on:
+  push:
+    tags:
+      - "v*-huada-*"
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.4.9"
+  TAG_NAME: "${{ github.ref_name }}"
+
+jobs:
+  # ---------------------------------------------------------------- #
+  # 0. 预检: 确认服务器配置已正确烧入 (含子模块 gitlink 是否指向我们的 fork)
+  # ---------------------------------------------------------------- #
+  preflight:
+    name: 预检-烧参校验
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
+
+      - name: 校验 hbb_common 烧入的服务器配置
+        shell: bash
+        env:
+          EXP_RENDEZVOUS: ${{ secrets.RENDEZVOUS_SERVER }}
+          EXP_KEY: ${{ secrets.RS_PUB_KEY }}
+          EXP_API: ${{ secrets.API_SERVER }}
+        run: |
+          set -e
+          CFG=libs/hbb_common/src/config.rs
+          echo "==> 子模块文件存在性"
+          test -f "$CFG" || { echo "FATAL: $CFG 不存在, 子模块未检出"; exit 1; }
+
+          echo "==> RENDEZVOUS_SERVERS"
+          grep -n 'RENDEZVOUS_SERVERS' "$CFG" | head -3
+          if grep -q "$EXP_RENDEZVOUS" "$CFG"; then
+            echo "OK: ID Server 已烧入"
+          else
+            echo "FATAL: ID Server 未烧入 (子模块 gitlink 可能仍指向上游)"
+            exit 1
+          fi
+
+          echo "==> RS_PUB_KEY"
+          if grep -q "$EXP_KEY" "$CFG"; then
+            echo "OK: 公钥已烧入"
+          else
+            echo "FATAL: 公钥未烧入"
+            exit 1
+          fi
+
+          echo "==> API Server (src/common.rs)"
+          if grep -q "$EXP_API" src/common.rs; then
+            echo "OK: API Server 已烧入"
+          else
+            echo "FATAL: API Server 未烧入"
+            exit 1
+          fi
+
+          echo "==> 确认无残留上游默认值"
+          if grep -q 'rs-ny.rustdesk.com' "$CFG"; then
+            echo "WARN: config.rs 仍存在上游默认 rendezvous 值, 请人工确认"
+            grep -n 'rs-ny.rustdesk.com' "$CFG"
+          fi
+
+      - name: 校验品牌化与本地密码函数
+        shell: bash
+        run: |
+          set -e
+          echo "==> Dart 包名必须仍为 flutter_hbb (全仓库 package:flutter_hbb 导入)"
+          head -1 flutter/pubspec.yaml
+          grep -q '^name: flutter_hbb$' flutter/pubspec.yaml || { echo "FATAL: Dart 包名被改动, 会导致全部 import 失效"; exit 1; }
+
+          echo "==> Rust 本地密码 FFI"
+          for fn in ensure_local_fixed_password refresh_local_fixed_password get_local_fixed_password; do
+            grep -q "pub fn $fn" src/flutter_ffi.rs || { echo "FATAL: 缺少 $fn"; exit 1; }
+          done
+          echo "OK: 3 个 FFI 函数就位"
+
+          echo "==> 确认未使用 flutter_rust_bridge v2 语法"
+          if grep -q 'frb(sync)' src/flutter_ffi.rs; then
+            echo "FATAL: 检测到 frb(sync), 与 flutter_rust_bridge 1.80 不兼容"
+            exit 1
+          fi
+
+          echo "==> Windows 窗口标题品牌化"
+          grep -n 'app_name' flutter/windows/runner/main.cpp | head -3
+
+          echo "==> Dart UI 刷新密码按钮"
+          grep -q 'refreshLocalFixedPassword' flutter/lib/desktop/pages/desktop_home_page.dart || { echo "FATAL: Dart 侧未接入刷新按钮"; exit 1; }
+          echo "OK: 品牌化与密码 UI 校验通过"
+
+  # ---------------------------------------------------------------- #
+  # 1. 生成 flutter_rust_bridge (必须重新生成: 我们新增了 3 个 FFI 函数)
+  # ---------------------------------------------------------------- #
+  generate-bridge:
+    name: 生成 bridge
+    needs: preflight
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get install ca-certificates -y
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc \
+            git \
+            g++ \
+            libclang-dev \
+            libgtk-3-dev \
+            llvm-dev \
+            nasm \
+            ninja-build \
+            pkg-config \
+            wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: bridge-ubuntu-22.04
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # Flutter 3.22.3: extended_text 14 需要更新的 Dart, 降级以便依赖解析
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: 确认新增 FFI 已生成到 Dart 侧
+        shell: bash
+        run: |
+          set -e
+          for fn in ensureLocalFixedPassword refreshLocalFixedPassword getLocalFixedPassword; do
+            grep -q "$fn" flutter/lib/generated_bridge.dart || { echo "FATAL: bridge 未生成 $fn"; exit 1; }
+            echo "OK: $fn"
+          done
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  # ---------------------------------------------------------------- #
+  # 2. 构建 RustDeskTempTopMostWindow (WindowInjection.dll)
+  # ---------------------------------------------------------------- #
+  build-topmost:
+    name: 构建 TopMostWindow
+    runs-on: windows-2022
+    steps:
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Download the source code
+        run: |
+          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+
+      - name: Build the project
+        run: |
+          cd RustDeskTempTopMostWindow && git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+          msbuild WindowInjection/WindowInjection.vcxproj -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: |
+            ./RustDeskTempTopMostWindow/WindowInjection/x64/Release/WindowInjection.dll
+
+  # ---------------------------------------------------------------- #
+  # 3. 构建 Windows x64 客户端
+  # ---------------------------------------------------------------- #
+  build-windows-x64:
+    name: Windows x64
+    needs: [generate-bridge, build-topmost]
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-x64-windows-static-rel-out.log" || true
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+          # usbmmidd_v2 (虚拟显示器驱动)
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          # 打印机驱动 (失败可忽略)
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+                Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+                mkdir ./rustdesk/drivers
+                mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+                Expand-Archive printer_driver_adapter.zip -DestinationPath .
+                mv -Force .\printer_driver_adapter.dll ./rustdesk
+            } else {
+                Write-Output "printer driver checksum mismatch, skip."
+            }
+          } catch {
+              Write-Host "Ignore the printer driver error."
+          }
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            echo "Runner.res: $runner_res";
+            cp $runner_res ./libs/portable/Runner.res;
+            ls -l ./libs/portable/Runner.res;
+          fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: 上传未打包目录 (便于逐文件排查)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: huada-remote-windows-x64-unpacked
+          path: rustdesk
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/huada-remote-${{ env.VERSION }}-x86_64.exe
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Build msi
+        continue-on-error: true
+        run: |
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../rustdesk
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          mv $msi.FullName ../../SignOutput/huada-remote-${{ env.VERSION }}-x86_64.msi
+          popd
+          sha256sum ./SignOutput/huada-remote-*.msi
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: huada-remote-windows-x64-installer
+          path: SignOutput
+
+      - name: Publish Release
+        continue-on-error: true
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ./SignOutput/huada-remote-*.exe
+            ./SignOutput/huada-remote-*.msi
