@@ -3184,7 +3184,6 @@ fn generate_random_password() -> String {
 }
 
 /// 首次启动：若本地未设置固定密码则自动生成
-#[flutter_rust_bridge::frb(sync)]
 pub fn ensure_local_fixed_password() -> SyncReturn<String> {
     let current = crate::ui_interface::get_option("password");
     if current.is_empty() {
@@ -3197,7 +3196,6 @@ pub fn ensure_local_fixed_password() -> SyncReturn<String> {
 }
 
 /// 刷新密码：本地生成新密码
-#[flutter_rust_bridge::frb(sync)]
 pub fn refresh_local_fixed_password() -> SyncReturn<String> {
     let new_pwd = generate_random_password();
     crate::ui_interface::set_option("password".to_string(), new_pwd.clone());
@@ -3205,7 +3203,6 @@ pub fn refresh_local_fixed_password() -> SyncReturn<String> {
 }
 
 /// 获取当前固定密码
-#[flutter_rust_bridge::frb(sync)]
 pub fn get_local_fixed_password() -> SyncReturn<String> {
     SyncReturn(crate::ui_interface::get_option("password"))
 }
