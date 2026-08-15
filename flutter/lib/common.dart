@@ -3596,8 +3596,20 @@ Future<bool> setServerConfig(
     return input;
   }
 
-  config.idServer = removeEndSlash(config.idServer.trim());
-  config.relayServer = removeEndSlash(config.relayServer.trim());
+  String stripScheme(String input) {
+    // Users sometimes paste http://host:port into ID/Relay fields.
+    // These fields expect host:port, so strip the accidental scheme.
+    var s = input.trim();
+    if (s.startsWith('https://')) {
+      s = s.substring(8);
+    } else if (s.startsWith('http://')) {
+      s = s.substring(7);
+    }
+    return s;
+  }
+
+  config.idServer = removeEndSlash(stripScheme(config.idServer));
+  config.relayServer = removeEndSlash(stripScheme(config.relayServer));
   config.apiServer = removeEndSlash(config.apiServer.trim());
   config.key = config.key.trim();
   if (controllers != null) {
