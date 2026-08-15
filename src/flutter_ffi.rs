@@ -1013,18 +1013,23 @@ pub fn main_set_option(key: String, value: String) {
     // If `is_allow_tls_fallback` and https proxy is used, we need to restart rendezvous mediator.
     // No need to check if https proxy is used, because this option does not change frequently
     // and restarting mediator is safe even https proxy is not used.
+    //
+    // Desktop (Windows/Linux/macOS) also needs a restart when ID/relay/API/key change,
+    // otherwise the existing rendezvous mediator keeps using the cached server list and
+    // the new settings never take effect until the next natural reconnect.
     let is_allow_tls_fallback = key.eq(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
     if is_allow_tls_fallback
         || key.eq("custom-rendezvous-server")
+        || key.eq(config::keys::OPTION_RELAY_SERVER)
+        || key.eq("api-server")
+        || key.eq("key")
         || key.eq(config::keys::OPTION_ALLOW_WEBSOCKET)
         || key.eq(config::keys::OPTION_DISABLE_UDP)
-        || key.eq("api-server")
     {
         if is_allow_tls_fallback {
             hbb_common::tls::reset_tls_cache();
         }
         set_option(key, value.clone());
-        #[cfg(target_os = "android")]
         crate::rendezvous_mediator::RendezvousMediator::restart();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::common::test_rendezvous_server();
