@@ -57,6 +57,23 @@ jobs:
           echo "==> 子模块文件存在性"
           test -f "$CFG" || { echo "FATAL: $CFG 不存在, 子模块未检出"; exit 1; }
 
+          # Secret 合法性守卫: 防止写入时被二次加密/带引号等错误
+          # (此类错误会表现为"未烧入", 极难定位; 此处提前给出明确诊断)
+          echo "==> Secret 形态自检 (仅打印长度, 不泄露值)"
+          echo "    EXP_RENDEZVOUS len=${#EXP_RENDEZVOUS}  EXP_KEY len=${#EXP_KEY}  EXP_API len=${#EXP_API}"
+          case "$EXP_API" in
+            http://*|https://*) ;;
+            *) echo "FATAL: API_SERVER Secret 值非法 (len=${#EXP_API}), 应以 http:// 或 https:// 开头。疑似写入时被二次加密。"; exit 1 ;;
+          esac
+          case "$EXP_RENDEZVOUS" in
+            *:*) ;;
+            *) echo "FATAL: RENDEZVOUS_SERVER Secret 值非法 (len=${#EXP_RENDEZVOUS}), 应为 host:port 形式。"; exit 1 ;;
+          esac
+          if [ "${#EXP_KEY}" -ne 44 ]; then
+            echo "FATAL: RS_PUB_KEY Secret 长度异常 (len=${#EXP_KEY}), base64 公钥应为 44 字符。"
+            exit 1
+          fi
+
           echo "==> RENDEZVOUS_SERVERS"
           grep -n 'RENDEZVOUS_SERVERS' "$CFG" | head -3
           if grep -q "$EXP_RENDEZVOUS" "$CFG"; then
@@ -373,13 +390,26 @@ jobs:
           name: topmostwindow-artifacts-x64
           path: "./rustdesk"
 
+      - name: 产物落地自检 (上传前确认目录非空)
+        shell: bash
+        run: |
+          set -e
+          test -d rustdesk || { echo "FATAL: rustdesk/ 目录不存在, Flutter 产物未落地"; exit 1; }
+          test -f rustdesk/rustdesk.exe || { echo "FATAL: rustdesk/rustdesk.exe 缺失"; exit 1; }
+          test -f rustdesk/librustdesk.dll || { echo "FATAL: rustdesk/librustdesk.dll 缺失 (Rust 侧未编译进产物)"; exit 1; }
+          echo "文件数: $(find rustdesk -type f | wc -l)"
+          du -sh rustdesk
+
       - name: 上传未打包目录 (便于逐文件排查)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: huada-remote-windows-x64-unpacked
           path: rustdesk
+          if-no-files-found: error
 
+      # 自解压打包失败不应连带丢失 msi 产物, 故降级为非阻断
       - name: Build self-extracted executable
+        continue-on-error: true
         shell: bash
         run: |
           sed -i '/dpiAware/d' res/manifest.xml
@@ -406,10 +436,12 @@ jobs:
           sha256sum ./SignOutput/huada-remote-*.msi
 
       - name: 上传安装包
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: huada-remote-windows-x64-installer
           path: SignOutput
+          if-no-files-found: warn
 
       - name: Publish Release
         continue-on-error: true
